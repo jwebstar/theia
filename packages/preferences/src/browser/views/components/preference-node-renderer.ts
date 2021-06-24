@@ -24,6 +24,8 @@ import { JSONValue } from '@theia/core/shared/@phosphor/coreutils';
 import debounce = require('@theia/core/shared/lodash.debounce');
 import { PreferenceTreeModel } from '../../preference-tree-model';
 import { PreferencesSearchbarWidget } from '../preference-searchbar-widget';
+import * as DOMPurify from '@theia/core/shared/dompurify';
+import * as markdownit from 'markdown-it';
 
 export const PreferenceNodeRendererFactory = Symbol('PreferenceNodeRendererFactory');
 export type PreferenceNodeRendererFactory = (node: Preference.TreeNode) => PreferenceNodeRenderer;
@@ -205,11 +207,17 @@ export abstract class PreferenceLeafNodeRenderer<ValueType extends JSONValue, In
         wrapper.appendChild(contentWrapper);
 
         const { description, markdownDescription } = this.preferenceNode.preference.data;
-        const descriptionToUse = markdownDescription || description;
-        if (descriptionToUse) {
+        if (markdownDescription) {
+            const markdownDescriptionWithSettingsLinks = this.fixSettingLinks(markdownDescription);
+            const renderedContent = this.getEngine().renderInline(markdownDescriptionWithSettingsLinks);
+            const markdownWrapper = document.createElement('div');
+            markdownWrapper.classList.add('pref-description');
+            markdownWrapper.innerHTML = DOMPurify.sanitize(renderedContent);
+            contentWrapper.appendChild(markdownWrapper);
+        } else if (description) {
             const descriptionWrapper = document.createElement('div');
             descriptionWrapper.classList.add('pref-description');
-            descriptionWrapper.textContent = descriptionToUse;
+            descriptionWrapper.textContent = description;
             contentWrapper.appendChild(descriptionWrapper);
         }
 
@@ -219,6 +227,16 @@ export abstract class PreferenceLeafNodeRenderer<ValueType extends JSONValue, In
         this.createInteractable(interactableWrapper);
 
         return wrapper;
+    }
+
+    // Based on: https://github.com/eclipse-theia/theia/blob/8dd74dbe6e1b7d6951a6d5412fef4beca77334d4/packages/preview/src/browser/markdown/markdown-preview-handler.ts
+    protected engine: markdownit | undefined;
+    protected getEngine(): markdownit {
+        this.engine = markdownit({
+            html: true,
+            linkify: true
+        });
+        return this.engine;
     }
 
     protected handleCogAction({ currentTarget }: KeyboardEvent | MouseEvent): void {
@@ -423,4 +441,104 @@ export abstract class PreferenceLeafNodeRenderer<ValueType extends JSONValue, In
     protected abstract createInteractable(container: HTMLElement): void;
     protected abstract getFallbackValue(): ValueType;
     protected abstract doHandleValueChange(): void;
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    /*
+        The below properties/methods are from:
+        - https://github.com/microsoft/vscode/blob/f07184772ad02eaa06ab1641714deee2bbb3853f/src/vs/workbench/contrib/preferences/browser/settingsLayout.ts
+            - knownTermMappings
+            - knownAcronyms
+        - https://github.com/microsoft/vscode/blob/f07184772ad02eaa06ab1641714deee2bbb3853f/src/vs/workbench/contrib/preferences/browser/settingsTree.ts
+            - fixSettingLinks
+        - https://github.com/microsoft/vscode/blob/f07184772ad02eaa06ab1641714deee2bbb3853f/src/vs/workbench/contrib/preferences/browser/settingsTreeModels.ts
+            - settingKeyToDisplayFormat
+            - wordifyKey
+            - trimCategoryForGroup
+    */
+
+    protected readonly knownTermMappings = new Map([
+        ['power shell', 'PowerShell'],
+        ['powershell', 'PowerShell'],
+        ['javascript', 'JavaScript'],
+        ['typescript', 'TypeScript']
+    ]);
+
+    protected readonly knownAcronyms = new Set(
+        ['css', 'html', 'scss', 'less', 'json', 'js', 'ts', 'ie', 'id', 'php', 'scm']
+    );
+
+    protected fixSettingLinks(text: string, linkify = true): string {
+        // Rewrite `#editor.fontSize#` to link format
+        return text.replace(/`#([^#]*)#`/g, (match, settingKey) => {
+            const targetDisplayFormat = this.settingKeyToDisplayFormat(settingKey);
+            const targetName = `${targetDisplayFormat.category}: ${targetDisplayFormat.label}`;
+            return linkify ?
+                `[${targetName}](#${settingKey})` :
+                `"${targetName}"`;
+        });
+    }
+
+    protected settingKeyToDisplayFormat(key: string, groupId = ''): { category: string, label: string; } {
+        const lastDotIdx = key.lastIndexOf('.');
+        let category = '';
+        if (lastDotIdx >= 0) {
+            category = key.substr(0, lastDotIdx);
+            key = key.substr(lastDotIdx + 1);
+        }
+
+        groupId = groupId.replace(/\//g, '.');
+        category = this.trimCategoryForGroup(category, groupId);
+        category = this.wordifyKey(category);
+
+        const label = this.wordifyKey(key);
+        return { category, label };
+    }
+
+    protected wordifyKey(key: string): string {
+        key = key
+            .replace(/\.([a-z0-9])/g, (_, p1) => ` › ${p1.toUpperCase()}`) // Replace dot with spaced '>'
+            .replace(/([a-z0-9])([A-Z])/g, '$1 $2') // Camel case to spacing, fooBar => foo Bar
+            .replace(/^[a-z]/g, match => match.toUpperCase()) // Upper casing all first letters, foo => Foo
+            .replace(/\b\w+\b/g, match => this.knownAcronyms.has(match.toLowerCase()) ? match.toUpperCase() : match);
+
+        for (const [k, v] of this.knownTermMappings) {
+            key = key.replace(new RegExp(`\\b${k}\\b`, 'gi'), v);
+        }
+
+        return key;
+    }
+
+    protected trimCategoryForGroup(category: string, groupId: string): string {
+        const doTrim = (forward: boolean) => {
+            const parts = groupId.split('.');
+            while (parts.length) {
+                const reg = new RegExp(`^${parts.join('\\.')}(\\.|$)`, 'i');
+                if (reg.test(category)) {
+                    return category.replace(reg, '');
+                }
+
+                if (forward) {
+                    parts.pop();
+                } else {
+                    parts.shift();
+                }
+            }
+
+            return undefined;
+        };
+
+        let trimmed = doTrim(true);
+        if (trimmed === undefined) {
+            trimmed = doTrim(false);
+        }
+
+        if (trimmed === undefined) {
+            trimmed = category;
+        }
+
+        return trimmed;
+    }
 }
